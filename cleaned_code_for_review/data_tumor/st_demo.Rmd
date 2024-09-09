@@ -1,0 +1,465 @@
+---
+title: "Spatial Transcriptomics Application of PCA"
+author: "Si Cheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+## Breast Tumor Data
+
+Tuning parameters of our method were obtained via 10-fold cross-validation, minimizing TMSE.
+```{r, fig.width = 12, fig.height = 9}
+library(SpatialPCA)
+library(ggplot2)
+library(bluster)
+library(tidyverse)
+
+load("STmod_rslt_full.RData")
+load("STmod_rslt_ft_full.RData")
+r = ncol(loadings)
+
+## SpatialPCA
+ST0 = ST
+ST = SpatialPCA_buildKernel(ST, kerneltype="gaussian", bandwidthtype="SJ")
+ST = SpatialPCA_EstimateLoading(ST,fast=FALSE,SpatialPCnum=r)
+ST = SpatialPCA_SpatialPCs(ST, fast=FALSE)
+
+for (j in 1:r){
+  utildes.pca[,j] = sign(mean(ST@SpatialPCs[j,] * utildes.pca[,j]))*utildes.pca[,j]
+  utildes.pred[,j] = sign(mean(ST@SpatialPCs[j,] * utildes.pred[,j]))*utildes.pred[,j]
+  utildes[,j] = sign(mean(ST@SpatialPCs[j,] * utildes[,j]))*utildes[,j]
+}
+
+df_pcs = cbind(ST@location, t(as.matrix(ST@SpatialPCs)), utildes, utildes.pca, utildes.pred)
+colnames(df_pcs) = c("x", "y",
+                     paste(rep(c("SpatialPCA", "RapPCA", "PCA", "PredPCA"), each = r), 1:r, sep = "_"))
+
+plot_err = function(df, r = 3, r_plot = 3, type = c('errors', 'pcs'), title = NULL){
+  if (type == 'errors'){
+    t1 = "Prediction errors for each PC"
+    t2 = 'Comparison of prediction errors'
+  } else {
+    if (is.null(title)){
+      t1 = paste("Top", r_plot, "PC scores")
+    } else {
+      t1 = title
+    }
+    t2 = 'Comparison of PC scores'
+  }
+  df_err = df %>% as.data.frame %>% 
+    pivot_longer(cols = -c(x,y), names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+            pc = sub(".*_", "", vname) %>% as.numeric())
+  
+  df_err31 = df %>% as.data.frame %>% select(x,y,RapPCA_1:RapPCA_20) %>%
+    pivot_longer(-c(x,y), names_to = "pc", names_prefix = "RapPCA_", values_to = "RapPCA_value") %>%
+    mutate(pc = as.numeric(pc))
+  
+  df_err3 = df %>% as.data.frame %>% pivot_longer(-c(x,y,RapPCA_1:RapPCA_20), 
+                                    names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+            pc = sub(".*_", "", vname) %>% as.numeric()) %>%
+    left_join(df_err31, by = c("x","y","pc"))
+
+  p2 = ggplot(df_err %>% filter(pc <= r_plot) %>%
+                mutate(pc = paste("PC", pc)), 
+              aes(x = x, y = y, color = value)) +
+      geom_point() + 
+      scale_color_gradient2(mid = 'white') +
+      facet_wrap(~ pc + method, ncol = 4) + theme_bw() +
+      labs(x = "x", y = "y", title = t1)
+  
+  p4 = ggplot(df_err3 %>% filter(pc <= r_plot), 
+              aes(x = RapPCA_value, y = value)) +
+    geom_jitter(aes(color = method), alpha = .5) +
+    geom_abline(intercept = 0, slope = 1, color = 'gray') +
+    geom_hline(yintercept = 0, color = 'gray') +
+    facet_wrap(~ pc, ncol = 3, scales = "free") + theme_bw() +
+    labs(x = "Proposed method", y = 'Other methods',
+         title = t2)
+  
+  return(list(err_map = p2, err_sp = p4))
+}
+
+plts = plot_err(df_pcs, type = 'pcs', r = r, r_plot = 3)
+plts$err_map
+```
+
+```{r, fig.width=12, fig.height=4}
+plts$err_sp
+```
+
+### Spatial Prediction (10-fold CV)
+
+We first compare the overall TMSE, MSPE, MSRE for different PCA algorithms, including SpatialPCA. Predictions for SpatialPCA PC scores were made with both TPRS smoothing (same as the remaining methods), and the built-in spatial extrapolation function from `SpatialPCA`.
+```{r}
+load("tumor_cv_spatpca_metrics.RData")
+cv_rslt_sp = readRDS("tumor_cv_spatpca.rda")
+
+cv_rslt = readRDS("tumor_cv_ft.rda")
+
+metrics_all = rbind(cv_rslt$metrics[,1:3],
+                    c(mean(tmse_sp), mean(mspe_sp), mean(msre_sp)), 
+                    c(mean(tmse_sp2), mean(mspe_sp2), mean(msre_sp)))
+rownames(metrics_all)[4:5] = c("spatial_pca", "spatial_pca_builtin")
+
+knitr::kable(metrics_all, digits = 2, caption = "Overall CV metrics")
+```
+
+Plots of prediction errors for each PC:
+```{r, fig.width = 12, fig.height = 9}
+uhats.sp = matrix(NA, nrow = nrow(y), ncol = r)
+K = length(cv_rslt$cv_idx)
+
+for (k in 1:K){
+  .idx = cv_rslt$cv_idx[[k]]
+  for (.r in 1:r){
+    flip_proposed = sign(mean(cv_rslt$utildes[.idx,.r] * cv_rslt$utildes.pca[.idx,.r]))
+    flip_pred = sign(mean(cv_rslt$utildes.pred[.idx,.r] * cv_rslt$utildes.pca[.idx,.r]))
+    flip_spat = sign(mean(utildes_sp[.idx,.r] * cv_rslt$utildes.pca[.idx,.r]))
+    cv_rslt$utildes[.idx, .r] = cv_rslt$utildes[.idx, .r] * flip_proposed
+    cv_rslt$uhats[.idx, .r] = cv_rslt$uhats[.idx, .r] * flip_proposed
+    cv_rslt$utildes.pred[.idx, .r] = cv_rslt$utildes.pred[.idx, .r] * flip_pred
+    cv_rslt$uhats.pred[.idx, .r] = cv_rslt$uhats.pred[.idx, .r] * flip_pred
+    utildes_sp[.idx, .r] = utildes_sp[.idx, .r] * flip_spat
+    cv_rslt_sp[[k]]$uhats_sp_tprs[, .r] = cv_rslt_sp[[k]]$uhats_sp_tprs[, .r] * flip_spat
+  }
+  uhats.sp[.idx,] = cv_rslt_sp[[k]]$uhats_sp_tprs
+}
+
+df_pcs2 = cbind(ST@location, uhats.sp - utildes_sp, 
+                cv_rslt$uhats - cv_rslt$utildes, 
+                cv_rslt$uhats.pca - cv_rslt$utildes.pca,
+                cv_rslt$uhats.pred - cv_rslt$utildes.pred)
+colnames(df_pcs2) = c("x", "y",
+                     paste(rep(c("SpatPCA", "RapPCA", "PCA", "PredPCA"), each = r), 1:r, sep = "_"))
+
+plts = plot_err(df_pcs2, type = 'errors', r = r, r_plot = 3)
+plts$err_map
+```
+
+The individual prediction MSEs for each PC:
+```{r, fig.width=10, fig.height=5}
+df_pcmse = rbind(cv_rslt$metrics[,-(1:3)], colMeans(mse_pc_sp))
+rownames(df_pcmse)[4] = "spatial_pca"
+
+df_pcmse = df_pcmse %>% as.data.frame %>% 
+  rownames_to_column(var = "method") %>%
+  pivot_longer(contains("pc"), names_to = "pc", names_prefix = "pc",
+               values_to = "individual_mse") %>%
+  mutate(pc = factor(pc, levels = as.character(1:r)))
+
+ggplot(df_pcmse, aes(x = pc, y = individual_mse, fill = method)) +
+  geom_col(position="dodge") + theme_bw() 
+```
+
+### Domain Detection
+```{r, fig.width=15, fig.height=5}
+library(ggpubr)
+
+relbl = function(lbls){
+  ord = order(table(lbls), decreasing = T)
+  lbl1 = case_when(lbls == as.character(ord[1]) ~ "1",
+                   lbls == as.character(ord[2]) ~ "2",
+                   lbls == as.character(ord[3]) ~ "3",
+                   lbls == as.character(ord[4]) ~ "4",
+                   lbls == as.character(ord[5]) ~ "5",
+                   lbls == as.character(ord[6]) ~ "6",
+                   lbls == as.character(ord[7]) ~ "7")
+  return(lbl1)
+}
+
+cl.spatpca= walktrap_clustering(7, ST@SpatialPCs,round(sqrt(dim(ST@location)[1])))
+cl.spatpca.ref=refine_cluster_10x(cl.spatpca,ST@location,shape="square") 
+cl.spatpca.ref1 = relbl(cl.spatpca.ref)
+
+cl.rappca = walktrap_clustering(7, t(utildes),round(sqrt(dim(ST@location)[1])))
+cl.rappca.ref=refine_cluster_10x(cl.rappca,ST@location,shape="square")
+cl.rappca.ref1 = relbl(cl.rappca.ref)
+
+cl.pca = walktrap_clustering(7, t(utildes.pca),round(sqrt(dim(ST@location)[1])))
+cl.pca.ref=refine_cluster_10x(cl.pca,ST@location,shape="square")
+cl.pca.ref1 = relbl(cl.pca.ref)
+
+cl.pred = walktrap_clustering(7, t(utildes.pred),round(sqrt(dim(ST@location)[1])))
+cl.pred.ref=refine_cluster_10x(cl.pred,ST@location,shape="square")
+cl.pred.ref1 = relbl(cl.pred.ref)
+
+library(RColorBrewer)
+# cbp_spatpca <- viridis_pal(option = "D")(7) 
+# cbp_spatpca = c(  "mediumaquamarine", "chocolate1","dodgerblue",  
+#                   "#F0E442","palegreen4","lightblue2","plum1")
+cbp_spatpca = brewer.pal(7, 'Set2')
+p.spatpca = plot_cluster(legend="right",location=ST@location,cl.spatpca.ref1,
+             pointsize=5,text_size=20 ,title_in=paste0("SpatialPCA"),color_in=cbp_spatpca)
+p.rappca = plot_cluster(legend="right",location=ST@location,cl.rappca.ref1,
+             pointsize=5,text_size=20 ,title_in=paste0("RapPCA"),color_in=cbp_spatpca)
+p.pca = plot_cluster(legend="right",location=ST@location,cl.pca.ref1,
+             pointsize=5,text_size=20 ,title_in=paste0("PCA"),color_in=cbp_spatpca)
+p.pred = plot_cluster(legend="right",location=ST@location,cl.pred.ref1,
+             pointsize=5,text_size=20 ,title_in=paste0("PredPCA"),color_in=cbp_spatpca)
+
+ggarrange(p.spatpca, p.rappca, p.pca, p.pred, nrow = 1, 
+          common.legend = TRUE, legend = "bottom")
+```
+
+```{r, message = FALSE}
+library(nnet) # multinom function
+library(DescTools) # PseudoR2 function
+library(mclust) # ARI
+
+multinom = nnet::multinom
+# H1 sample was used in Shang(2022)
+anno = read.csv("meta/H1_labeled_coordinates.tsv" ,sep="\t") %>%
+  mutate(rown = paste(round(x), "x", round(y), "_1", sep = "")) %>%
+  filter(rown %in% rownames(location))
+
+loc_anno = location %>% as.data.frame %>% rownames_to_column("rown") %>%
+  left_join(anno, by = "rown")
+
+ind_na = which((loc_anno$label=="undetermined"))
+ARI = c(adjustedRandIndex(loc_anno$label[-ind_na], cl.spatpca[-ind_na]),
+       adjustedRandIndex(loc_anno$label[-ind_na], cl.rappca[-ind_na]),
+       adjustedRandIndex(loc_anno$label[-ind_na], cl.pca[-ind_na]),
+       adjustedRandIndex(loc_anno$label[-ind_na], cl.pred[-ind_na]))
+
+pseudoR2 = NULL
+fit <- multinom(loc_anno$label ~ as.matrix(as.data.frame(t(ST@SpatialPCs))),
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2 = c(pseudoR2, PseudoR2(fit,c("McFaddenAdj")))
+
+fit <- multinom(loc_anno$label ~ as.matrix(as.data.frame(utildes)), 
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2 = c(pseudoR2, PseudoR2(fit,c("McFaddenAdj")))
+
+fit <- multinom(loc_anno$label ~ as.matrix(as.data.frame(utildes.pca)), 
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2 = c(pseudoR2, PseudoR2(fit,c("McFaddenAdj")))
+
+fit <- multinom(loc_anno$label ~ as.matrix(as.data.frame(utildes.pred)), 
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2 = c(pseudoR2, PseudoR2(fit,c("McFaddenAdj")))
+
+names(ARI) = names(pseudoR2) = c("SpatialPCA", "RapPCA", "PCA", "PredPCA")
+knitr::kable(rbind(ARI, pseudoR2), digits = 4, caption = "Clustering metrics")
+```
+Tuning our PCA algorithm based on metrics specific for clustering (instead of TMSE):
+We examine a range of values for $\gamma$ and $\lambda$, and calculate three metrics for clustering performance.
+
+* Adjusted rand index (ARI): needs ground truth. Measures the number of sample pairs that are assigned similarly (being in the same cluster or not) by a clustering algorithm vs the ground truth. Higher is better.
+* Pseudo $R^2$: needs ground truth. Measures the goodness of model fit (likelihood ratio), where we use the inferred labels to predict the true ones. Higher is better.
+* Silhouette scores: does NOT need the ground truth. Reflects the difference between the average intra-cluster distance vs the average inter-cluster distance. Higher is better.
+
+A natural idea is to use silhouette scores as the criterion for selecting $\gamma,\lambda$, and potentially improve our ARI and pseudo $R^2$. The relationship between silhouette scores and ARI/pseudo $R^2$ is visualized below, with the performance of SpatialPCA as the reference (dashed lines):
+
+```{r, fig.width=5, fig.height=4}
+load("cl_tuning_demo_finer.RData")
+
+plot(clust_tuning[3,], clust_tuning[1,], pch = 19,
+     # ylim = range(c(unlist(clust_tuning[1:2,]))),
+     ylim = c(0, .7), xlim = c(-3,3),
+     xlab = "avg silhouette score", ylab = "ARI or Pseudo-R2")
+points(clust_tuning[3,], clust_tuning[2,], pch = 19, col = 'blue')
+abline(h = ARI[1], lty = 2)
+abline(h = pseudoR2[1], lty = 2, col = 'blue')
+legend("bottomleft", c("ARI", "Pseudo-R2"), pch = 19, col = c("black", "blue"))
+```
+
+Visualizing our "best" clustering: selected via average silhouette score
+
+```{r, fig.width=14, fig.height=5}
+best_idx = which.max(clust_tuning[3,])
+utildes.best = clust_tuning[,best_idx]$utildes
+print(unlist(clust_tuning[1:2,best_idx]))
+cl.best = walktrap_clustering(7, t(utildes.best),round(sqrt(dim(ST@location)[1])))
+cl.best.ref = relbl(cl.best)
+cl.best.lbl = case_when(cl.best.ref == "1" ~ "4",
+                        cl.best.ref == "2" ~ "6",
+                        cl.best.ref == "3" ~ "7",
+                        cl.best.ref == "4" ~ "3",
+                        cl.best.ref == "5" ~ "5",
+                        cl.best.ref == "6" ~ "1",
+                        TRUE ~ "2")
+cl.spatpca.lbl = case_when(cl.spatpca.ref1 == "1" ~ "4",
+                        cl.spatpca.ref1 == "2" ~ "3",
+                        cl.spatpca.ref1 == "3" ~ "6",
+                        cl.spatpca.ref1 == "4" ~ "1",
+                        cl.spatpca.ref1 == "5" ~ "5",
+                        cl.spatpca.ref1 == "6" ~ "2",
+                        TRUE ~ "7")
+
+cl.pred.lbl = case_when(cl.pred.ref1 == "1" ~ "4",
+                        cl.pred.ref1 == "2" ~ "6",
+                        cl.pred.ref1 == "3" ~ "3",
+                        cl.pred.ref1 == "4" ~ "5",
+                        cl.pred.ref1 == "5" ~ "1",
+                        cl.pred.ref1 == "6" ~ "2",
+                        TRUE ~ "7")
+
+cl.pca.lbl = case_when(cl.pca.ref1 == "1" ~ "4",
+                        cl.pca.ref1 == "2" ~ "6",
+                        cl.pca.ref1 == "3" ~ "2",
+                        cl.pca.ref1 == "4" ~ "5",
+                        cl.pca.ref1 == "5" ~ "1",
+                        cl.pca.ref1 == "6" ~ "3",
+                        TRUE ~ "7")
+
+p.new = plot_cluster(legend="right",location=ST@location,cl.best.lbl,
+             pointsize=5,text_size=20 ,title_in=paste0("RapPCA"),color_in=cbp_spatpca)
+p.spatpca2 = plot_cluster(legend="right",location=ST@location,cl.spatpca.lbl,
+             pointsize=5,text_size=20 ,title_in=paste0("SpatialPCA"),color_in=cbp_spatpca)
+p.pca2 = plot_cluster(legend="right",location=ST@location,cl.pca.lbl,
+             pointsize=5,text_size=20 ,title_in=paste0("PCA"),color_in=cbp_spatpca)
+p.pred2 = plot_cluster(legend="right",location=ST@location,cl.pred.lbl,
+             pointsize=5,text_size=20 ,title_in=paste0("PredPCA"),color_in=cbp_spatpca)
+p.truth = plot_cluster(location, loc_anno$label, pointsize=5,text_size=20 ,
+                  "Truth",cbp_spatpca,legend="right")
+
+ggarrange(plotlist = list(p.truth, p.new, p.spatpca2, p.pred2, p.pca2), 
+          nrow = 2, ncol = 3, common.legend = TRUE, legend = 'bottom')
+```
+
+Performance metrics: the comparison in the SpatialPCA paper removed the `undetermined` locations based on the ground truth labels, so they were comparing 7 inferred labels vs 6 ground truth labels.
+
+We make the comparison here by either not excluding any location, or excluding `undetermined` locations based on both the inferred and the ground truth labels.
+```{r}
+perc_na = mean(cl.best.lbl == "7" & loc_anno$label != "undetermined")
+perc_na_spatpca = mean(cl.spatpca.lbl == "7" & loc_anno$label != "undetermined")
+ind_na1 = which((loc_anno$label=="undetermined") | cl.best.lbl == "7")
+ind_na2 = which((loc_anno$label=="undetermined") | cl.spatpca.lbl == "7")
+
+ARI_tuned = c(adjustedRandIndex(loc_anno$label, cl.best.lbl),
+        adjustedRandIndex(loc_anno$label[-ind_na1], cl.best.lbl[-ind_na1]),
+        adjustedRandIndex(loc_anno$label, cl.spatpca.lbl),
+        adjustedRandIndex(loc_anno$label[-ind_na2], cl.spatpca.lbl[-ind_na2]))
+
+pseudoR2_tuned = NULL
+fit <- multinom(loc_anno$label ~ utildes,
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2_tuned = c(pseudoR2_tuned, PseudoR2(fit,c("McFaddenAdj")))
+fit <- multinom(loc_anno$label[-ind_na1] ~ utildes[-ind_na1,],
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2_tuned = c(pseudoR2_tuned, PseudoR2(fit,c("McFaddenAdj")))
+fit <- multinom(loc_anno$label ~ as.matrix(as.data.frame(t(ST@SpatialPCs))),
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2_tuned = c(pseudoR2_tuned, PseudoR2(fit,c("McFaddenAdj")))
+fit <- multinom(loc_anno$label[-ind_na2] ~ as.matrix(as.data.frame(t(ST@SpatialPCs[,-ind_na2]))),
+                maxit = 1000, MaxNWts = 2000,model = TRUE)
+pseudoR2_tuned = c(pseudoR2_tuned, PseudoR2(fit,c("McFaddenAdj")))
+
+names(ARI_tuned) = names(pseudoR2_tuned) = c("RapPCA_all", "RapPCA_sub", 
+                                             "SpatialPCA_all", "SpatialPCA_sub")
+knitr::kable(rbind(ARI_tuned, pseudoR2_tuned), digits = 4, caption = "Clustering metrics")
+```
+
+Metrics breakdown by true labels:
+```{r, fig.width=12, fig.height=5}
+prec_recall = function(lbl_inf, lbl_true, class_inf, class_true){
+  precision = mean(lbl_true %in% class_true & lbl_inf %in% class_inf) / mean(lbl_inf %in% class_inf)
+  recall = mean(lbl_true %in% class_true & lbl_inf %in% class_inf) / mean(lbl_true %in% class_true)
+  
+  f1 = 2*precision*recall / (precision + recall)
+  out = c(precision, recall, f1)
+  names(out) = c("precision", "recall", "F1")
+  return(out)
+}
+
+tab = NULL
+for (j in 1:6){
+  tab = rbind(tab, 
+              c(prec_recall(cl.best.lbl, loc_anno$label, as.character(j),
+                            sort(unique(loc_anno$label))[j]),
+                prec_recall(cl.spatpca.lbl, loc_anno$label, as.character(j),
+                            sort(unique(loc_anno$label))[j]),
+                prec_recall(cl.pred.lbl, loc_anno$label, as.character(j),
+                            sort(unique(loc_anno$label))[j]),
+                prec_recall(cl.pca.lbl, loc_anno$label, as.character(j),
+                            sort(unique(loc_anno$label))[j])
+                ))
+}
+colnames(tab) = paste(rep(c("prec", "recall", "F1"), 4), 
+                      rep(c("RapPCA", "SpatialPCA", "PredPCA", "PCA"), each = 3), sep = "_")
+rownames(tab) = sort(unique(loc_anno$label))[1:6]
+knitr::kable(tab, digits = 3, caption = "Precision and recall breakdown by true label")
+
+df_tab = as.data.frame(tab) %>% rownames_to_column(var = "true_label") %>%
+  pivot_longer(prec_RapPCA:F1_PCA, names_to = c("metric", "method"), values_to = "value",
+               names_sep = "_") %>%
+  mutate(metric = case_when(metric == "prec" ~ "precision", TRUE ~ metric))#,
+         # method = paste(method, "PCA", sep = ""))
+
+ggplot(df_tab %>%
+         mutate(method = factor(method, levels = c("PCA", "RapPCA", "PredPCA", "SpatialPCA"))), 
+       aes(x = true_label, y = value, fill = method)) +
+  geom_bar(position="dodge", stat = "identity") + theme_bw() +
+  coord_flip() + facet_wrap(~metric)
+
+tab2 = rbind(colMeans(tab),
+             c(prec_recall(cl.best.lbl, loc_anno$label, c("3","6"),
+                            sort(unique(loc_anno$label))[c(3,6)]),
+                prec_recall(cl.spatpca.lbl, loc_anno$label, c("3","6"),
+                            sort(unique(loc_anno$label))[c(3,6)]),
+                prec_recall(cl.pred.lbl, loc_anno$label, c("3","6"),
+                            sort(unique(loc_anno$label))[c(3,6)])
+                ))
+rownames(tab2) = c("average", "cancer: in situ and invasive")
+knitr::kable(tab2, digits = 3, caption = "Precision and recall breakdown: summary")
+```
+
+### High Resolution Map Reconstruction
+```{r, fig.width=15, fig.height=8}
+if (!file.exists("clusters_hi_res_tuned.RData")){
+  STsimu_high_ST = SpatialPCA_highresolution(ST, platform="ST",newlocation=NULL)
+coords_hi_res = STsimu_high_ST@highPos %>% 
+  scale(center = colMeans(location), scale = apply(location, 2, sd))
+x1train = coords[,1]
+x2train = coords[,2]
+rappca_hi_res = pca_hi_res = predpca_hi_res = matrix(NA, nrow = nrow(STsimu_high_ST@highPos),
+                                                     ncol = r)
+for (j in 1:r){
+  mod <- mgcv::gam(clust_tuning[,best_idx]$utildes[,j]~s(x1train, x2train, 
+                                                       bs="tp", k=200, m=2, fx=FALSE))
+  rappca_hi_res[,j] <- predict(mod, data.frame(x1train = coords_hi_res[,1],
+                                       x2train = coords_hi_res[,2]))
+}
+
+cluster_RapPCA_high = walktrap_clustering(7, latent_dat=t(rappca_hi_res),200)
+save(cluster_RapPCA_high, rappca_hi_res, coords_hi_res,
+     file = "clusters_hi_res_tuned.RData")
+} else {
+  load("clusters_hi_res.RData")
+  cluster_RapPCA_high1 = cluster_RapPCA_high
+  rappca_hi_res1 = rappca_hi_res
+  load("clusters_hi_res_tuned.RData")
+}
+
+color_in=c(  "palegreen4", "chocolate1","plum1",  "#F0E442","mediumaquamarine","dodgerblue","lightblue2")
+title_in="SpatialPCA high res"
+p1 = plot_cluster(STsimu_high_ST@highPos, as.character(cluster_SpatialPCA_high), 
+             pointsize=2,text_size=20 ,title_in,color_in,legend="right")
+p2 = plot_cluster(STsimu_high_ST@highPos, relbl(cluster_RapPCA_high), 
+             pointsize=2,text_size=20 ,"RapPCA high res (silhouette)",color_in,legend="right") 
+p21 = plot_cluster(STsimu_high_ST@highPos, relbl(cluster_RapPCA_high1), 
+             pointsize=2,text_size=20 ,"RapPCA high res (TMSE)",color_in,legend="right") 
+p3 = plot_cluster(STsimu_high_ST@highPos, relbl(cluster_PCA_high), 
+             pointsize=2,text_size=20 ,"PCA high res",color_in,legend="right") 
+p4 = plot_cluster(STsimu_high_ST@highPos, relbl(cluster_PredPCA_high), 
+             pointsize=2,text_size=20 ,"PredPCA high res",color_in,legend="right") 
+p5 = plot_cluster(location, loc_anno$label, pointsize=2,text_size=20 ,
+                  "Truth low res",color_in,legend="right")
+ggarrange(plotlist = list(p1,p2, p21, p5, p3,p4), nrow = 2, ncol = 3,
+          common.legend = FALSE, legend = "right")
+```
+
+```{r, fig.width = 12, fig.height = 9}
+df_pcs_highres = cbind(STsimu_high_ST@highPos, t(as.matrix(STsimu_high_ST@highPCs)), 
+                       rappca_hi_res1, pca_hi_res, predpca_hi_res)
+colnames(df_pcs_highres) = colnames(df_pcs)
+plts = plot_err(df_pcs_highres, type = 'pcs', r = r, r_plot = 3, 
+                title = 'Top 3 PC scores, high-resolution')
+plts$err_map
+```

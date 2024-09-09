@@ -1,0 +1,412 @@
+---
+title: 'Representative and predictive PCA: simulations (updated)'
+author: "Si Cheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Simulation setting
+
+Randomly draw $n = 200$ points within the unit square $[0,1]\times[0,1]$. For each point, generate $d$ covariates $X_{n\times d}$, and calculate $s_1$ independently distributed PCs as
+$$
+PC^j = f(X\beta^j) + \epsilon_j, \ j = 1,\ldots, s_1
+$$
+where each $\varepsilon_j$ is drawn from Normal$(0,\Sigma)$ where $\Sigma$ has an exponential covariance structure. Then, generate $s_2$ PCs that contain only noise, i.e. from Normal$(0,\Sigma)$. The $s_1$ predictable and $s_2$ unpredictable PCs are scaled so that they on average have the same variance.
+
+The multivariate outcome $Y_{n\times p}$ is obtained via
+$$
+Y_{n\times p} = PC_{n\times s}Z_{s\times p} + \epsilon_{n\times p}
+$$
+where $Z$ represents the loadings and the entries of $\epsilon$ are iid Gaussian noise.
+
+We run standard PCA and our approach on 100 replicates of data, extract 3 PC scores and predict each of them with RF followed by TPRS. We compare TMSE, MSPE and MSRE, along with the individual prediction errors $\lVert \hat u_j - u_j\rVert_2^2$ for each PC.
+
+We investigate scenarios with linear and non-linear mean function $f$ (associated with low- and high-dimensional $X$ respectively), and predictable vs unpredictable PCs, where $s_1$ is large and small relative to $s_2$, respectively. So there are 4 scenarios in total.
+
+```{r}
+library(tidyverse)
+library(forcats)
+library(ggpubr)
+library(RColorBrewer)
+
+combn_rslts = function(rslt){
+  st = length(rslt)
+  df = df2 = df_lambda = df_lambda_ratio = df_lambdas = NULL
+  df_combn = NULL
+  best_pars = NULL
+  
+  for (j in 1:st){
+    df = rbind(df, 
+               cbind(rslt[[j]]$metric1_pr[[1]] %>% group_by(gm) %>% slice_min(tmse), 1),
+               cbind(rslt[[j]]$metric1_pr[[2]] %>% group_by(gm) %>% slice_min(tmse), 2),
+               cbind(rslt[[j]]$metric1_pr[[3]] %>% group_by(gm) %>% slice_min(tmse), 3))
+    
+    temp1 = cbind(rslt[[j]]$metric1_pr[[1]] %>% slice_min(tmse)
+                            %>% select(c(gm, lambda, lambda.ratio)), 1)
+    temp2 = cbind(rslt[[j]]$metric1_pr[[2]] %>% slice_min(tmse)
+                            %>% select(c(gm, lambda, lambda.ratio)), 2)
+    temp3 = cbind(rslt[[j]]$metric1_pr[[3]] %>% slice_min(tmse)
+                            %>% select(c(gm, lambda, lambda.ratio)), 3)
+    colnames(temp1)[4] = colnames(temp2)[4] = colnames(temp3)[4] = "PC"
+    best_pars = rbind(best_pars,
+                      temp1, temp2, temp3)
+    # df_lambda = rbind(df_lambda, 
+    #            cbind(rslt[[j]]$metric1_pr[[1]] %>% group_by(lambda) %>% slice_min(tmse), 1),
+    #            cbind(rslt[[j]]$metric1_pr[[2]] %>% group_by(lambda) %>% slice_min(tmse), 2),
+    #            cbind(rslt[[j]]$metric1_pr[[3]] %>% group_by(lambda) %>% slice_min(tmse), 3))
+    # 
+    # df_lambda_ratio = rbind(df_lambda_ratio, 
+    #            cbind(rslt[[j]]$metric1_pr[[1]] %>% group_by(lambda.ratio) %>% slice_min(tmse), 1),
+    #            cbind(rslt[[j]]$metric1_pr[[2]] %>% group_by(lambda.ratio) %>% slice_min(tmse), 2),
+    #            cbind(rslt[[j]]$metric1_pr[[3]] %>% group_by(lambda.ratio) %>% slice_min(tmse), 3))
+    
+    df_lambdas = rbind(df_lambdas, 
+               cbind(rslt[[j]]$metric1_pr[[1]] %>% group_by(lambda, lambda.ratio) %>% slice_min(tmse), 1),
+               cbind(rslt[[j]]$metric1_pr[[2]] %>% group_by(lambda, lambda.ratio) %>% slice_min(tmse), 2),
+               cbind(rslt[[j]]$metric1_pr[[3]] %>% group_by(lambda, lambda.ratio) %>% slice_min(tmse), 3))
+    
+    # cols of df2: tmse, mspe, msre, msre_trn
+    df2 = rbind(df2, cbind(rslt[[j]]$metric1_pred, c(1,2,3)))
+    temp = rslt[[j]]$rslt_pca
+    temp[3] = as.numeric(rslt[[j]]$metric1_pr[[3]] %>% filter(gm == -1) %>% select(msre))
+    temp2 = rslt[[j]]$rslt_pred##
+    temp2[3] = rslt[[j]]$metric1_pred[nrow(rslt[[j]]$metric1_pred),4]##
+    df_combn = rbind(df_combn,
+                     temp2, rslt[[j]]$rslt_pr, 
+                     # rslt[[j]]$rslt_pred, rslt[[j]]$rslt_pr, 
+                     temp)
+                     ##rslt[[j]]$rslt_pca)
+  }
+  colnames(df)[ncol(df)] = #colnames(df_lambda)[ncol(df_lambda)] = colnames(df_lambda_ratio)[ncol(df_lambda_ratio)] = 
+    colnames(df_lambdas)[ncol(df_lambdas)] = "PC"
+  colnames(df)[4:7] = # colnames(df_lambda)[4:7] = colnames(df_lambda_ratio)[4:7] = 
+    colnames(df_lambdas)[4:7] = c("TMSE", "MSPE", "MSRE", "MSRE_trn")
+  # colnames(df2) = c("tmse", "mspe", "msre", "msre_trn", "pc")
+  colnames(df2)[1:4] = c("TMSE", "MSPE", "MSRE", "MSRE_trn")
+  colnames(df2)[ncol(df2)] = "PC"
+  if ("u.diff1" %in% colnames(df2)){
+    df2 = df2 %>% as.data.frame %>% rename(mse_pc = u.diff1)
+  } 
+  # colnames(df_combn) = c("tmse", "mspe", "msre", "pc1", "pc2", "pc3") ##
+  colnames(df_combn) = c("TMSE", "MSPE", "MSRE_trn", "PC1", "PC2", "PC3")
+  df_combn = df_combn %>% as.data.frame %>%
+    mutate(method = rep(c("PredPCA", "RapPCA", "PCA"), st)) %>%
+    pivot_longer(-method, names_to = "metric", values_to = "value") %>%
+    mutate(type_metric = case_when(grepl("PC", metric) ~ "Individual MSE",
+                                   TRUE ~ "Overall"),
+           method = factor(method, levels = c("PCA", "RapPCA", "PredPCA")))
+  
+  # df_combn2 = df_combn %>% select(-type_metric) %>%
+  #   pivot_wider(names_from = method:metric, values_from = value) %>% unnest # %>%
+    # pivot_longer(-contains("Rap"), names_sep = "_", names_to = c('method','metric')) %>%
+    # pivot_longer(contains("Rap"), names_sep = "_", names_to = c('dummy', ''))
+  df_combn2 = df_combn %>% 
+    mutate(algo = case_when(method == 'RapPCA' ~ 'RapPCA', TRUE ~ 'Refs'),
+           seed = rep(1:(nrow(df_combn)/18), each = 18)) %>%
+    pivot_wider(names_from = algo, values_from = value,
+                id_cols = c(method, metric, seed)) 
+  
+  for (j in 0:99){
+    df_combn2$RapPCA[(18*j)+(1:6)] = df_combn2$RapPCA[(18*j)+(7:12)]
+    df_combn2$RapPCA[(18*j)+(13:18)] = df_combn2$RapPCA[(18*j)+(7:12)]
+  }
+  df_combn2 = df_combn2 %>% filter(!is.na(Refs))
+  df_combn2$metric = fct_relevel(df_combn2$metric, 
+                                 "MSPE", "MSRE_trn", "TMSE", "PC1", "PC2", "PC3")
+  
+  df = df %>% select(gm, TMSE, MSPE, MSRE, MSRE_trn, r2, mse_pc, PC) %>% 
+    union(df2 %>% as.data.frame %>% mutate(gm = 99)) %>%
+    mutate(gamma = as.factor(gm) %>% recode("-1" = "PCA", "99" = "PredPCA"),
+           method = case_when(gm == -1 ~ 'PCA',
+                       gm == 99 ~ 'PredPCA',
+                       TRUE ~ 'RapPCA')) %>%
+    pivot_longer(-c(gm, gamma, method, PC), 
+                 names_to = "metric", values_to = "value") %>%
+    mutate(metric = recode(metric, `1` = "mse:pc1", `2` = "mse:pc2", `3` = "mse:pc3"),
+           method = factor(method, levels = c("PCA", "RapPCA", "PredPCA")))
+  
+  # df_lambda = df_lambda %>% select(lambda, TMSE, MSPE, MSRE, MSRE_trn, r2, mse_pc, PC) %>% 
+  #   pivot_longer(-c(lambda, PC), 
+  #                names_to = "metric", values_to = "value") %>%
+  #   mutate(metric = recode(metric, `1` = "mse:pc1", `2` = "mse:pc2", `3` = "mse:pc3"))
+  # 
+  # df_lambda_ratio = df_lambda_ratio %>% select(lambda.ratio, TMSE, MSPE, MSRE, MSRE_trn, r2, mse_pc, PC) %>% 
+  #   pivot_longer(-c(lambda.ratio, PC), 
+  #                names_to = "metric", values_to = "value") %>%
+  #   mutate(metric = recode(metric, `1` = "mse:pc1", `2` = "mse:pc2", `3` = "mse:pc3"))
+  
+  df_lambdas_m = df_lambdas %>% filter(gm > 0) %>%
+    select(lambda, lambda.ratio, TMSE, MSPE, MSRE, MSRE_trn, r2, mse_pc, PC) %>% 
+    pivot_longer(-c(lambda, lambda.ratio, PC), 
+                 names_to = "metric", values_to = "value") %>%
+    mutate(metric = recode(metric, `1` = "mse:pc1", `2` = "mse:pc2", `3` = "mse:pc3")) %>%
+    group_by(lambda, lambda.ratio, PC, metric) %>%
+    summarize(value = mean(value))
+  
+  # lbler = c(`1` = "PC1", `2` = "PC2", `3` = "PC3")
+  
+  p1 = ggplot(df %>% filter(metric %in% c("TMSE", "MSPE", "MSRE_trn")) %>%
+                mutate(PC = paste("PC", PC)),# "mse_pc")), 
+              aes(x = as.factor(gm), y = value)) +
+    geom_boxplot(aes(fill = method)) +
+    facet_wrap(~ PC + metric, scales = "free_y", nrow = 3) +
+    theme_bw() +
+    labs(x = "gamma", title = "Metric vs gamma for each PC")
+  
+  # p1_lambda = ggplot(df_lambda %>% filter(metric %in% c("TMSE", "MSPE", "MSRE_trn")) %>%
+  #               mutate(PC = paste("PC", PC)),# "mse_pc")), 
+  #             aes(x = as.factor(lambda), y = value)) +
+  #   geom_boxplot() +
+  #   facet_wrap(~ PC + metric, scales = "free_y", nrow = 3) +
+  #   theme_bw() +
+  #   labs(x = "lambda1", title = "Metric vs lambda1 for each PC")
+  # 
+  # p1_lambda_ratio = ggplot(df_lambda_ratio %>% filter(metric %in% c("TMSE", "MSPE", "MSRE_trn")) %>%
+  #               mutate(PC = paste("PC", PC)),# "mse_pc")), 
+  #             aes(x = as.factor(lambda.ratio), y = value)) +
+  #   geom_boxplot() +
+  #   facet_wrap(~ PC + metric, scales = "free_y", nrow = 3) +
+  #   theme_bw() +
+  #   labs(x = "lambda1 / lambda2", title = "Metric vs lambda1/lambda2 for each PC")
+  
+  p1_lambdas_tmse = ggplot(df_lambdas_m %>% filter((metric == "TMSE") & (PC == 1)),
+              aes(x = as.factor(lambda), y = as.factor(lambda.ratio), fill = value)) +
+    geom_tile() + theme_bw() + scale_fill_distiller() +
+    labs(x = "lambda1", y = "lambda2 / lambda1", 
+         title = "TMSE")
+  p1_lambdas_mspe = ggplot(df_lambdas_m %>% filter((metric == "MSPE") & (PC == 1)),
+              aes(x = as.factor(lambda), y = as.factor(lambda.ratio), fill = value)) +
+    geom_tile() + theme_bw() + scale_fill_distiller() +
+    labs(x = "lambda1", y = "lambda2 / lambda1", 
+         title = "MSPE")
+  p1_lambdas_msre = ggplot(df_lambdas_m %>% filter((metric == "MSRE_trn") & (PC == 1)),
+              aes(x = as.factor(lambda), y = as.factor(lambda.ratio), fill = value)) +
+    geom_tile() + theme_bw() + scale_fill_distiller() +
+    labs(x = "lambda1", y = "lambda2 / lambda1", 
+         title = "MSRE_trn")
+  
+  p1_lambdas = ggarrange(p1_lambdas_mspe, p1_lambdas_msre, p1_lambdas_tmse, 
+                         ncol = 3, nrow = 1, common.legend = FALSE) +
+  theme(plot.margin = margin(0.5,0,0.25,0, "inches")) 
+  
+  p_pars = ggplot(best_pars %>% filter((PC == 1) & (gm != -1)) %>%
+                    pivot_longer(-c("PC"), names_to = "parameter", values_to = "selected_value") %>%
+                    mutate(parameter = as.factor(parameter)),
+                  aes(x = parameter, y = selected_value)) +
+    geom_boxplot()
+                         #, legend = 'bottom')
+  # p1_lambdas = ggplot(df_lambdas_m %>% filter(metric %in% c("TMSE", "MSPE", "MSRE_trn")) %>%
+  #               mutate(PC = paste("PC", PC)),# "mse_pc")), 
+  #             aes(x = as.factor(lambda), y = as.factor(lambda.ratio), fill = value)) +
+  #   geom_tile() +
+  #   facet_wrap(~ PC + metric, scales = "free_y", nrow = 3) +
+  #   theme_bw() +
+  #   labs(x = "lambda1", y = "lambda1 / lambda2", 
+  #        title = "Metric vs lambda1 and lambda2 for each PC")
+  
+  p1.1 = ggplot(df %>% filter(metric %in% c("TMSE", "MSPE", "MSRE_trn") & PC == 1),# "mse_pc")), 
+              aes(x = as.factor(gm), y = value)) +
+    geom_boxplot(aes(fill = method)) +
+    facet_wrap(~ metric, scales = "free_y") +
+    theme_bw() +
+    labs(x = "gamma", title = " ")
+  
+  p2 = ggplot(df_combn, aes(x = metric, y = value)) +
+    geom_boxplot(aes(fill = method)) +
+    facet_wrap(~type_metric, scales = "free") +
+    theme_bw() +
+    labs(title = " ")
+  
+  p2.1 = ggplot(df_combn, aes(x = metric, y = value)) +
+    geom_violin(aes(fill = method)) +
+    facet_wrap(~type_metric, scales = "free") +
+    theme_bw() +
+    labs(title = " ")
+  
+  p_scp = ggplot(df_combn2, aes(x = RapPCA, y = Refs, color = method)) +
+    geom_point() +
+    facet_wrap(~metric, scales = 'free') +
+    theme_bw() +
+    geom_abline(intercept = 0, slope = 1, linetype = 2)  +
+    labs(title = " ")
+  
+  return(list(p1 = p1, p2 = p2, p1.1 = p1.1, p2.1 = p2.1, p_scp = p_scp,
+              # p1_lambda = p1_lambda, p1_lambda_ratio = p1_lambda_ratio,
+              p1_lambdas = p1_lambdas, p_pars = p_pars))
+}
+```
+
+## MSPE vs MSE for each individual PC
+
+The two metrics are the same for each separate PC, because
+$$
+\text{MSPE} = \lVert (\hat u - \tilde u)v^\top\rVert_F^2 = \text{tr}\left((\hat u - \tilde u)v^\top v (\hat u - \tilde u)^\top\right) = \lVert \hat u - \tilde u\rVert_2^2
+$$
+since $v^\top v = I$. 
+
+## Case 1: 6 PCs (3 pred. & 3 unpred.) with similar contribution
+```{r,fig.width = 12, fig.height = 8}
+load("rslts/sim_case123_updated.RData")
+# rslt = readRDS("rslts/sim_case1_updated.rda")
+p = combn_rslts(case1)
+p$p1
+```
+
+```{r, fig.width=12, fig.height=4}
+p$p2
+p$p1_lambdas
+```
+
+## Case 1b: 6 PCs (3 pred. & 3 unpred.), the former have larger contribution
+```{r,fig.width = 12, fig.height = 8}
+# rslt = readRDS("rslts/sim_case2_updated.rda")
+p2 = combn_rslts(case2)
+p2$p1
+```
+
+```{r, fig.width=12, fig.height=4}
+p2$p2
+p2$p1_lambdas
+```
+
+## Case 2: 6 PCs (3 pred. & 3 unpred.), similar contribution, quadratic mean
+```{r,fig.width = 12, fig.height = 8}
+# rslt = readRDS("rslts/sim_case2_updated.rda")
+p3 = combn_rslts(case3)
+p3$p1
+```
+
+```{r, fig.width=12, fig.height=4}
+p3$p2
+p3$p1_lambdas
+```
+
+## Case 3: 6 PCs (3 pred. & 3 unpred.), similar contribution, quadratic mean with interactions
+```{r,fig.width = 12, fig.height = 8}
+case4 = readRDS("rslts/sim_case4_interaction2.rda")
+p4 = combn_rslts(case4)
+p4$p1
+```
+
+```{r, fig.width=12, fig.height=4}
+p4$p2
+p4$p1_lambdas
+```
+
+```{r}
+library(ggpubr)
+
+ggarrange(p$p1.1, p2$p1.1, p4$p1.1, 
+          labels = c("A: Scenario 1", "B: Scenario 2", "C: Scenario 3"),
+          ncol = 1, nrow = 3)
+
+ggarrange(p$p2.1, p2$p2.1, p4$p2.1, #p$p2, p2$p2, p4$p2, 
+          labels = c("A: Scenario 1", "B: Scenario 2", "C: Scenario 3"),
+          ncol = 1, nrow = 3)
+
+ggarrange(p$p_scp, p2$p_scp, p4$p_scp, #p$p2, p2$p2, p4$p2, 
+          labels = c("A: Scenario 1", "B: Scenario 2", "C: Scenario 3"),
+          ncol = 1, nrow = 3)
+
+ggarrange(p$p1_lambdas, p2$p1_lambdas, p4$p1_lambdas, #p$p2, p2$p2, p4$p2, 
+          labels = c("A: Scenario 1", "B: Scenario 2", "C: Scenario 3"),
+          ncol = 1, nrow = 3)
+```
+
+## Optimality of our solution in case 1
+```{r, eval = FALSE}
+library(Matrix)
+library(RColorBrewer)
+load("rslts/case1_suppl_image.RData")
+
+ytrn = y
+xtrn = x.scaled
+coords.trn = coords
+n.trn = nrow(xtrn)
+  
+Xtrn = polyK(xtrn, xtrn, 1)
+Btrn = smooth.construct(s(coord1, coord2, bs="tp", k=n.trn, m=2),
+                        data = list(coord1 = coords.trn[,1], coord2 = coords.trn[,2]),
+                        knots = NULL)
+S = Btrn$S[[1]]
+
+obj_rad = function(gm, lambda, lambda.ratio, rslt, theta, delta){
+  
+  Ztrn = cbind(1, Xtrn, Btrn$X/lambda.ratio)
+  p = ncol(Ztrn)
+  D = dmat
+  
+  v = v0 = rslt$v
+  norm_12 = norm(v0[1:2], '2')
+  theta0 = atan(v0[1]/v0[2])
+  v[1] = norm_12 * sin(theta)
+  v[2] = norm_12 * cos(theta)
+  ab = rslt$ab
+  u.orig = ytrn%*%v
+  pen = as.matrix(bdiag(1, Xtrn, S/lambda.ratio))
+  obj = sum((ytrn - u.orig%*%t(v))^2) + gm*sum((u.orig - Ztrn%*%ab)^2) + 
+    delta*sum(ab^2) + lambda*t(ab)%*%pen%*%ab
+  
+  return(list(obj = obj, theta0 = theta0, obj0 = rslt$obj.orig))
+}
+
+obj_rad_mc = function(par_idx, theta, delta){
+  temp = obj_rad(pars[par_idx,]$gm, pars[par_idx,]$lambda, pars[par_idx,]$lambda.ratio,
+                 rslts[,par_idx], theta, delta)
+  return(temp)
+}
+
+.idx = which(pars$gm %in% c(0, 1, 4, 6, 8) &
+               pars$lambda %in% c(1, 2, 8) & 
+               pars$lambda.ratio == 1)
+par_theta_grid = expand.grid(par_idx = .idx, theta = seq(0,.98,.02)*2*pi)
+
+objvals_rad = parallel::mcmapply(FUN = obj_rad_mc, mc.cores = parallel::detectCores() - 2,
+                                 par_idx = par_theta_grid$par_idx, theta = par_theta_grid$theta,
+                                 delta = .05)
+
+par_theta_grid$gm = rep(pars[.idx,]$gm, 50)
+par_theta_grid$lambda = rep(pars[.idx,]$lambda, 50)
+par_theta_grid$lambda.ratio = rep(pars[.idx,]$lambda.ratio, 50)
+par_theta_grid$obj = unlist(objvals_rad[1,])
+par_theta_grid$obj_star = unlist(objvals_rad[3,])
+
+ggplot(data = par_theta_grid %>% filter(gm %in% c(0, 1, 4, 6, 8) & 
+                                          lambda %in% c(1, 2, 8) & 
+                                   lambda.ratio == 1) %>%
+         mutate(gamma = as.factor(gm), lambda = paste("lambda = ", lambda), 
+                lambda.ratio = as.factor(lambda.ratio)),
+       aes(x = theta, y = obj - obj_star, color = gamma)) +
+  geom_line() +
+  scale_colour_manual(values = brewer.pal(n = 9, "Blues")[2:6]) +
+  facet_wrap(~ lambda, scales = "free_y") + theme_bw() +
+  labs(x = "theta", y = "objective - our optimum") 
+
+.idx = which(pars$gm %in% c(0, 1, 4, 6, 8) &
+               pars$lambda == 1 & 
+               pars$lambda.ratio %in% c(1, 2, 8))
+par_theta_grid = expand.grid(par_idx = .idx, theta = seq(0,.98,.02)*2*pi)
+
+objvals_rad = parallel::mcmapply(FUN = obj_rad_mc, mc.cores = parallel::detectCores() - 2,
+                                 par_idx = par_theta_grid$par_idx, theta = par_theta_grid$theta,
+                                 delta = .05)
+
+par_theta_grid$gm = rep(pars[.idx,]$gm, 50)
+par_theta_grid$lambda = rep(pars[.idx,]$lambda, 50)
+par_theta_grid$lambda.ratio = rep(pars[.idx,]$lambda.ratio, 50)
+par_theta_grid$obj = unlist(objvals_rad[1,])
+par_theta_grid$obj_star = unlist(objvals_rad[3,])
+
+ggplot(data = par_theta_grid %>%
+         mutate(gamma = as.factor(gm), lambda = paste("lambda = ", lambda), 
+                lambda.ratio = paste("lambda.ratio = ", lambda.ratio)),
+       aes(x = theta, y = obj - obj_star, color = gamma)) +
+  geom_line() +
+  scale_colour_manual(values = brewer.pal(n = 9, "Blues")[2:6]) +
+  facet_wrap(~ lambda.ratio, scales = "free_y") + theme_bw() +
+  labs(x = "theta", y = "objective - our optimum") 
+```
