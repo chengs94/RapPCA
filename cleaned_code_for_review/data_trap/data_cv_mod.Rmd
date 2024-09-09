@@ -1,0 +1,279 @@
+---
+title: "PCA for Multivariate TRAP Measurements, Cross-Validation"
+author: "Si Cheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+27 variables: 18 for UFP, 5 for BC, 1 for each of CO, CO2, NO2, PM2.5.
+
+PM2.5 was dropped, and other pollutants except `ufp_pmdisc` were normalized with PM2.5 concentration. 
+
+10-fold CV was conducted to assess the overall and prediction performance of each method.
+
+```{r, fig.width = 12, fig.height = 4}
+library(tidyverse)
+library(ggplot2)
+
+# load("cv_rslt_u_w_int.rda")
+load("cv_rslt_u_w_int_v2.rda")
+
+knitr::kable(cv_rslt$metrics, digits = 4,
+             caption = "Overall metrics, and prediction errors for each PC, evaluated by 10-fold CV")
+
+K = length(cv_rslt$cv_raw)
+msre_trn = rep(0,3)
+r = 3
+for (k in 1:K){
+  msre_trn[1] = msre_trn[1] + cv_rslt$cv_raw[[k]]$rslt_prpc1[[r]] %>%
+                 slice_min(tmse) %>% select(msre_trn) %>% as.numeric
+  msre_trn[2] = msre_trn[2] + cv_rslt$cv_raw[[k]]$rslt_prpc1[[r]] %>%
+                 filter(gm == -1) %>% select(msre_trn) %>% as.numeric
+  msre_trn[3] = msre_trn[3] + cv_rslt$cv_raw[[k]]$metric1_pred[r,'msre.trn']
+}
+msre_trn = msre_trn / K
+
+df_pc1 = cv_rslt$cv_raw[[1]]$rslt_prpc1[[1]] %>%
+                 group_by(gm) %>%slice_min(tmse) %>% 
+                 select(-c(lambda, lambda.ratio, cond_n))
+.temp = c(99, cv_rslt$cv_raw[[1]]$metric1_pred[1,])
+names(.temp) = colnames(df_pc1)
+df_pc1 = rbind(df_pc1, .temp)
+for (k in 2:K){
+  .temp = c(99, cv_rslt$cv_raw[[k]]$metric1_pred[1,])
+  names(.temp) = colnames(df_pc1)
+  df_pc1 = rbind(df_pc1,
+                 cv_rslt$cv_raw[[k]]$rslt_prpc1[[1]] %>%
+                 group_by(gm) %>%slice_min(tmse) %>% 
+                 select(-c(lambda, lambda.ratio, cond_n)),
+                 .temp)
+}
+
+df_pc1 = df_pc1 %>% group_by(gm) %>% 
+  summarize(across(everything(), mean)) %>%
+  mutate(gamma = as.factor(gm), 
+         method = case_when(gm == -1 ~ 'pca',
+                            gm >= 99 ~ 'pred_pca',
+                            TRUE ~ 'proposed')) %>%
+  pivot_longer(-c(gm, gamma, method), names_to = "metric", values_to = "value") %>%
+  mutate(method = factor(method, levels = c("pca", "proposed", "pred_pca")))
+
+p1 = ggplot(df_pc1 %>% filter(metric %in% c("mspe", "msre_trn", "tmse")), 
+            aes(x = gamma, y = value)) +
+            geom_point(aes(color = method)) +
+            facet_wrap(~ metric, scales = "free_y") +
+            theme_bw() + 
+            labs(title = "Metric vs gamma for the 1st PC") 
+
+p1
+```
+
+```{r}
+library(sf)
+library(ggmap)
+library(gstat)
+
+load("pca_data.RData")
+cov_grid = readRDS("cov_grid.rda")
+
+crs_deg <- 4326
+crs_m <- 32148
+map_x_labels <- c(seq(-122.5, -121.9, 0.2)) #0.2
+map_y_labels <- c(seq(47.2, 48, 0.2))
+monitoring_area_shp <- readRDS("monitoring_area_shp.rda") %>% st_transform(crs_deg)
+monitoring_land_shp <- readRDS("monitoring_land_shp.rda")
+grid_covars_shp <- cov_grid %>%
+  st_as_sf(., coords=c("longitude","latitude"), remove = FALSE,
+           crs=crs_deg)
+grid_covars_shp$in_study_area <- st_intersects(grid_covars_shp, monitoring_land_shp,
+                                               sparse = FALSE) %>% apply(., 1, any)
+
+bbox <- st_bbox(st_transform(st_buffer(st_transform(monitoring_area_shp, crs_m), 10000), crs_deg))
+names(bbox) <- c("left", "bottom", "right", "top")
+map0 <- suppressMessages(get_stamenmap(
+    bbox = bbox, 
+    zoom = 10,
+    # zoom = 11, 
+    maptype = "toner-lite" #has airport symbol
+))
+
+plot_err = function(df, r = 3){
+  df_err = df %>% pivot_longer(-c(longitude, latitude), 
+                                   names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+            pc = sub(".*_", "", vname) %>% as.numeric())
+  
+  df_err2 = df %>% pivot_longer(-c(longitude, latitude, pca_1, pca_2, pca_3), 
+                                    names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+            pc = sub(".*_", "", vname) %>% as.numeric()) %>%
+    mutate(pca_err = case_when(pc == 1 ~ pca_1, pc == 2 ~ pca_2, TRUE ~ pca_3))
+  
+  df_err3 = df %>% pivot_longer(-c(longitude, latitude, proposed_1, proposed_2, proposed_3), 
+                                    names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+            pc = sub(".*_", "", vname) %>% as.numeric()) %>%
+    mutate(proposed_err = case_when(pc == 1 ~ proposed_1, pc == 2 ~ proposed_2, TRUE ~ proposed_3))
+  
+  p2 = ggmap(ggmap = map0, darken = c(.5, "white")) +
+    geom_sf(data=monitoring_land_shp, inherit.aes = F, alpha=0, size=0.1) +
+      geom_point(data = df_err, aes(x = longitude, y = latitude,
+                                    color = value, size = abs(value))) +
+      scale_color_gradient2() +
+      facet_wrap(~ method + pc, ncol = 3) + theme_bw() +
+      coord_sf(expand = F) + guides(size = FALSE) +
+      scale_x_continuous(breaks = map_x_labels, labels = map_x_labels ) +
+      scale_y_continuous(breaks = map_y_labels,
+                         labels = format(map_y_labels,digits = 1, nsmall = 1)) +
+      scale_size(range = c(1,3)) +
+      labs(x = "Longitude", y = "Latitude", 
+          title = "Prediction errors for each PC")
+  
+  p3 = ggplot(df_err2, aes(x = pca_err, y = value)) +
+    geom_jitter(aes(color = method), alpha = .5) +
+    geom_abline(intercept = 0, slope = 1, color = 'gray') +
+    geom_hline(yintercept = 0, color = 'gray') +
+    facet_wrap(~ pc, ncol = 3, scales = "free") + theme_bw() +
+    labs(x = "PCA pred errors", y = 'pred errors',
+         title = 'Comparison of prediction errors')
+  
+  p4 = ggplot(df_err3, aes(x = proposed_err, y = value)) +
+    geom_jitter(aes(color = method), alpha = .5) +
+    geom_abline(intercept = 0, slope = 1, color = 'gray') +
+    geom_hline(yintercept = 0, color = 'gray') +
+    facet_wrap(~ pc, ncol = 3, scales = "free") + theme_bw() +
+    labs(x = "Our pred errors", y = 'pred errors',
+         title = 'Comparison of prediction errors')
+  
+  return(list(err_map = p2, err_sp1 = p3, err_sp2 = p4))
+}
+```
+
+```{r, fig.width = 15, fig.height = 15}
+load("mod_grid_u_v2_corrected.RData")
+
+if (!file.exists("idw_pcs_df.rda")){
+  grid_resolution <- 0.003
+  grid_idp <- 1.5 
+  grid_nmax <- 10
+  r = 3
+  finer_grid <- st_as_sf(grid_covars_shp, coords = c("longitude", "latitude"),  crs= crs_deg) %>%
+    # make a rectangular box w/ evenly spaced points at ~500 m resolution
+    st_bbox() %>% st_as_sfc() %>%
+    st_make_grid(cellsize = grid_resolution, what = "centers") %>% 
+    # view in df format
+    st_as_sf()
+  
+  idw_fun = function(.uhat){
+    idw_pcs = idw(formula = .uhat ~ 1,
+                  locations = st_as_sf(grid_covars_shp, coords = c("longitude", "latitude"),  
+                                     remove = F, crs= crs_deg), 
+                  newdata = finer_grid, idp=grid_idp, 
+                  nmax=grid_nmax)
+  }
+  idw.pr = apply(uhats, 2, idw_fun)
+  idw.pred = apply(uhats.pred, 2, idw_fun)
+  idw.pca = apply(uhats.pca, 2, idw_fun)
+  
+  idw_df = idw.pr[[1]] %>% select(geometry)
+  for (j in 1:r){
+    idw_df = cbind(idw_df, idw.pr[[j]]$var1.pred, idw.pca[[j]]$var1.pred, idw.pred[[j]]$var1.pred)
+  }
+  colnames(idw_df)[-ncol(idw_df)] = paste(rep(c("proposed", "pca", "pred"), r), 
+                             rep(1:r, each = 3), sep = "_")
+  
+  idw_df = st_intersection(idw_df, monitoring_land_shp) %>% cbind(., st_coordinates(.))
+  
+  saveRDS(idw_df, "idw_pcs_df.rda")
+} else {
+  idw_df = readRDS("idw_pcs_df.rda")
+}
+
+plot_pcs = function(.idw_df, diff = FALSE, title = NULL){
+  .idw_df = .idw_df %>% 
+    mutate(across(-c(X,Y,geometry), function(x) x * sign(mean(x)))) 
+  if (diff){
+    .idw_df = .idw_df %>% 
+      mutate_at(vars(contains('_1')), function(x) x - .idw_df$pca_1) %>%
+      mutate_at(vars(contains('_2')), function(x) x - .idw_df$pca_2) %>%
+      mutate_at(vars(contains('_3')), function(x) x - .idw_df$pca_3)
+  }
+  
+  idw_df1 = .idw_df %>%
+    pivot_longer(-c(X,Y,geometry), names_to = "vname", values_to = "value") %>% 
+    mutate(method = sub("_.*", "", vname),
+          pc = sub(".*_", "", vname) %>% as.numeric())
+  if (diff) idw_df1 = idw_df1 %>% filter(method != 'pca')
+
+  p1 = ggmap(ggmap = map0, darken = c(.5, "white")) +
+    geom_raster(data = idw_df1 %>% 
+                  mutate(pc = paste("PC", pc),
+                         method = recode(method, 'proposed' = "RapPCA",
+                                         'pca' = "PCA",
+                                         'pred' = "PredPCA")), 
+                inherit.aes = F, 
+                aes(fill = value, x=round(X, 6), y=round(Y, 6)),
+                interpolate = T)  +
+    geom_sf(data=monitoring_land_shp, inherit.aes = F, alpha=0, size=0.1) 
+    # scale_fill_gradient(name = "1000pt/cm3", low = "yellow", high = "red") +
+  
+  if (diff){
+    p1 = p1 + scale_fill_gradient2()
+  } else {
+    p1 = p1 + scale_fill_gradient2()
+    # p1 = p1 + scale_fill_viridis_c(option = "cividis")#, trans = "log",
+                       # labels = scales::number_format(accuracy = 1)) +
+  }
+    
+  p1 = p1 + facet_wrap(~ pc + method, ncol = 3) + theme_bw() +
+    coord_sf(expand = F) +
+    scale_x_continuous(breaks = map_x_labels, labels = map_x_labels ) +
+    scale_y_continuous(breaks = map_y_labels,
+                       labels = format(map_y_labels,digits = 1, nsmall = 1)
+                       ) +
+    labs(x = "Longitude", y = "Latitude", title = title) 
+
+  p1
+}
+
+plot_pcs(idw_df, FALSE, 'Smoothed PC scores')
+```
+
+```{r, fig.width = 15, fig.height = 15}
+plot_pcs(idw_df, TRUE, 'Smoothed differences of PC scores, PCA as baseline')
+```
+
+Plots of loadings:
+```{r}
+for (j in 1:r){
+  flip_proposed = sign(mean(loadings[,j]*loadings.pca[,j]))
+  flip_pred = sign(mean(loadings.pred[,j]*loadings.pca[,j]))
+  loadings[,j] = loadings[,j]*flip_proposed
+  loadings.pred[,j] = loadings.pred[,j]*flip_pred
+}
+
+v_mod = cbind(loadings, loadings.pca, loadings.pred) %>% as.data.frame 
+colnames(v_mod) = c(paste(rep(c("RapPCA", "PCA", "PredPCA"), each = r), 1:r, sep = "_"))
+v_mod = v_mod %>% rownames_to_column(var = "pollutant") %>% rowwise() %>% 
+  mutate(maxabs = max(abs(RapPCA_1:PredPCA_3))) %>% ungroup() %>%
+  # slice_max(order_by = maxabs, n = 20) %>%
+  pivot_longer(RapPCA_1:PredPCA_3, 
+                names_to = c("method", "pc"), values_to = "loading",
+                names_pattern = "(.*)_(.*)") %>%
+  mutate(pollutant = recode_factor(pollutant,
+                                   'ufp_pnc.noscreen' = 'ufp_ptrak_20',
+                                   'ufp_pnc.screen' = 'ufp_ptrak_36',
+                                   'bc_uv' = 'bc_uv_diff')) %>%
+  mutate(pollutant = factor(pollutant, levels = sort(levels(pollutant))))
+
+ggplot(v_mod %>% mutate(pc = paste("PC", pc),
+                        method = factor(method, levels = c("PCA", "RapPCA", "PredPCA"))), 
+       aes(x = loading, y = pollutant)) +
+    geom_col(aes(fill = method), position="dodge") +
+    facet_wrap(~pc, scales = 'free_x') + theme_bw() + 
+  labs(title = "PC loadings")
+```
